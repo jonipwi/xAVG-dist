@@ -93,7 +93,7 @@ If your router uses interface lists, you can restrict the rule to WAN traffic:
 Create `dist/.env` next to the executable:
 
 ```ini
-XAVG_BLACKLIST_URL=https://bixio.xyz/api/public/blacklist.json
+XAVG_BLACKLIST_URL=https://xavg.bixio.xyz/api/public/blacklist.json
 
 MT_HOST=192.168.88.1:22
 MT_USER=xavg-client
