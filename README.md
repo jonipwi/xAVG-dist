@@ -5,7 +5,7 @@ This guide shows how to use the standalone xAVG client to download the public bl
 Public feed:
 
 ```text
-https://bixio.xyz/api/public/blacklist.json
+https://xavg.bixio.xyz/api/public/blacklist.json
 ```
 
 The feed returns only public IP addresses:
