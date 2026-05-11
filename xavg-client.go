@@ -17,97 +17,145 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const defaultFeedURL = "https://bixio.xyz/api/public/blacklist.json"
+const (
+	defaultIPFeedURL   = "https://xavg.bixio.xyz/api/public/blacklist.json"
+	defaultCIDRFeedURL = "https://xavg.bixio.xyz/api/public/cidr-blacklist.json"
+)
 
 type Config struct {
-	FeedURL string
-	MTHost  string
-	MTUser  string
-	MTPass  string
-	List    string
-	Comment string
-	DryRun  bool
+	IPFeedURL   string
+	CIDRFeedURL string
+	MTHost      string
+	MTUser      string
+	MTPass      string
+	IPList      string
+	CIDRList    string
+	IPComment   string
+	CIDRComment string
+	DryRun      bool
 }
 
 type BlacklistFeed struct {
-	IPs []string `json:"ips"`
+	IPs   []string `json:"ips"`
+	CIDRs []string `json:"cidrs"`
 }
 
 func main() {
 	_ = loadEnvFile(".env")
 
 	cfg := Config{}
-	flag.StringVar(&cfg.FeedURL, "url", "", "public xAVG blacklist JSON URL; defaults to XAVG_BLACKLIST_URL or https://bixio.xyz/api/public/blacklist.json")
+	flag.StringVar(&cfg.IPFeedURL, "url-ip", "", "public xAVG IPv4 blacklist JSON URL; defaults to XAVG_BLACKLIST_URL or https://xavg.bixio.xyz/api/public/blacklist.json")
+	flag.StringVar(&cfg.CIDRFeedURL, "url-cidr", "", "public xAVG CIDR blacklist JSON URL; defaults to XAVG_CIDR_BLACKLIST_URL or https://xavg.bixio.xyz/api/public/cidr-blacklist.json")
 	flag.StringVar(&cfg.MTHost, "mt-host", "", "MikroTik SSH endpoint; defaults to MT_HOST or 192.168.88.1:22")
 	flag.StringVar(&cfg.MTUser, "mt-user", "", "MikroTik SSH username; defaults to MT_USER or xavg-client")
 	flag.StringVar(&cfg.MTPass, "mt-pass", "", "MikroTik SSH password; defaults to MT_PASS")
-	flag.StringVar(&cfg.List, "list", "", "MikroTik address-list name; defaults to MT_BLACKLIST_LIST or blacklist")
-	flag.StringVar(&cfg.Comment, "comment", "", "comment for new address-list entries; defaults to MT_BLACKLIST_COMMENT or xavg-public-blacklist")
+	flag.StringVar(&cfg.IPList, "list-ip", "", "MikroTik IPv4 address-list name; defaults to MT_BLACKLIST_LIST or blacklist")
+	flag.StringVar(&cfg.CIDRList, "list-cidr", "", "MikroTik CIDR address-list name; defaults to MT_CIDR_BLACKLIST_LIST or cidr_blacklist")
+	flag.StringVar(&cfg.IPComment, "comment-ip", "", "comment for IPv4 address-list entries; defaults to MT_BLACKLIST_COMMENT or xavg-public-blacklist")
+	flag.StringVar(&cfg.CIDRComment, "comment-cidr", "", "comment for CIDR address-list entries; defaults to MT_CIDR_BLACKLIST_COMMENT or xavg-public-cidr-blacklist")
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "print changes without writing to MikroTik")
 	flag.Parse()
 
-	cfg.FeedURL = firstNonEmpty(cfg.FeedURL, getenv("XAVG_BLACKLIST_URL", ""), defaultFeedURL)
+	cfg.IPFeedURL = firstNonEmpty(cfg.IPFeedURL, getenv("XAVG_BLACKLIST_URL", ""), defaultIPFeedURL)
+	cfg.CIDRFeedURL = firstNonEmpty(cfg.CIDRFeedURL, getenv("XAVG_CIDR_BLACKLIST_URL", ""), defaultCIDRFeedURL)
 	cfg.MTHost = firstNonEmpty(cfg.MTHost, getenv("MT_HOST", ""), "192.168.88.1:22")
 	cfg.MTUser = firstNonEmpty(cfg.MTUser, getenv("MT_USER", ""), "xavg-client")
 	cfg.MTPass = firstNonEmpty(cfg.MTPass, getenv("MT_PASS", ""))
-	cfg.List = firstNonEmpty(cfg.List, getenv("MT_BLACKLIST_LIST", ""), "blacklist")
-	cfg.Comment = firstNonEmpty(cfg.Comment, getenv("MT_BLACKLIST_COMMENT", ""), "xavg-public-blacklist")
+	cfg.IPList = firstNonEmpty(cfg.IPList, getenv("MT_BLACKLIST_LIST", ""), "blacklist")
+	cfg.CIDRList = firstNonEmpty(cfg.CIDRList, getenv("MT_CIDR_BLACKLIST_LIST", ""), "cidr_blacklist")
+	cfg.IPComment = firstNonEmpty(cfg.IPComment, getenv("MT_BLACKLIST_COMMENT", ""), "xavg-public-blacklist")
+	cfg.CIDRComment = firstNonEmpty(cfg.CIDRComment, getenv("MT_CIDR_BLACKLIST_COMMENT", ""), "xavg-public-cidr-blacklist")
 
 	if cfg.MTPass == "" {
 		log.Fatal("MT_PASS is required; set it in .env, environment, or -mt-pass")
 	}
 
-	ips, err := fetchBlacklist(cfg.FeedURL)
+	interval, err := time.ParseDuration(getenv("SCHEDULER", "1h"))
 	if err != nil {
-		log.Fatal("fetch blacklist:", err)
+		log.Fatal("invalid SCHEDULER duration:", err)
 	}
-	log.Printf("loaded %d public IPs from %s", len(ips), cfg.FeedURL)
+
+	log.Printf("scheduler started: running sync now and every %s", interval)
+	for {
+		if err := syncAllFeeds(cfg); err != nil {
+			log.Printf("sync failed: %v", err)
+		}
+
+		timer := time.NewTimer(interval)
+		<-timer.C
+	}
+}
+
+func syncAllFeeds(cfg Config) error {
+	if err := syncFeedToList(cfg, cfg.IPFeedURL, cfg.IPList, cfg.IPComment, "ip"); err != nil {
+		return err
+	}
+
+	if err := syncFeedToList(cfg, cfg.CIDRFeedURL, cfg.CIDRList, cfg.CIDRComment, "cidr"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func syncFeedToList(cfg Config, feedURL, list, comment, mode string) error {
+	entries, err := fetchBlacklist(feedURL, mode)
+	if err != nil {
+		return fmt.Errorf("fetch %s blacklist: %w", mode, err)
+	}
+	log.Printf("loaded %d %s entries from %s", len(entries), mode, feedURL)
 
 	client, err := newSSHClient(cfg)
 	if err != nil {
-		log.Fatal("mikrotik ssh:", err)
+		return fmt.Errorf("mikrotik ssh: %w", err)
 	}
 	defer client.Close()
 
-	existing, err := existingAddressList(client, cfg.List)
+	existing, err := existingAddressList(client, list)
 	if err != nil {
-		log.Fatal("load existing MikroTik address-list:", err)
+		return fmt.Errorf("load existing MikroTik address-list: %w", err)
 	}
-	log.Printf("loaded %d existing entries from MikroTik address-list %q", len(existing), cfg.List)
+	log.Printf("loaded %d existing entries from MikroTik address-list %q", len(existing), list)
 
 	added := 0
 	skipped := 0
-	for _, ip := range ips {
-		if existing[ip] {
+	for _, entry := range entries {
+		if existing[entry] {
 			skipped++
 			continue
 		}
 
 		if cfg.DryRun {
-			log.Printf("[dry-run] would add %s to address-list %q", ip, cfg.List)
+			log.Printf("[dry-run] would add %s to address-list %q", entry, list)
 			added++
 			continue
 		}
 
-		if err := addAddressListEntry(client, cfg.List, ip, cfg.Comment); err != nil {
-			log.Printf("add %s failed: %v", ip, err)
+		if err := addAddressListEntry(client, list, entry, comment); err != nil {
+			log.Printf("add %s failed: %v", entry, err)
 			continue
 		}
-		existing[ip] = true
+		existing[entry] = true
 		added++
-		log.Printf("added %s to address-list %q", ip, cfg.List)
+		log.Printf("added %s to address-list %q", entry, list)
 	}
 
 	if cfg.DryRun {
-		log.Printf("dry-run complete: would add=%d skipped_existing=%d", added, skipped)
-		return
+		log.Printf("dry-run complete for %q: would add=%d skipped_existing=%d", list, added, skipped)
+		return nil
 	}
-	log.Printf("sync complete: added=%d skipped_existing=%d", added, skipped)
+	log.Printf("sync complete for %q: added=%d skipped_existing=%d", list, added, skipped)
+	return nil
 }
 
-func fetchBlacklist(url string) ([]string, error) {
+func fetchBlacklist(url, mode string) ([]string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -124,23 +172,39 @@ func fetchBlacklist(url string) ([]string, error) {
 	}
 
 	seen := map[string]bool{}
-	for _, raw := range feed.IPs {
-		ip := strings.TrimSpace(raw)
-		if !isPublicIPv4(ip) {
-			continue
+
+	if mode == "ip" {
+		for _, raw := range feed.IPs {
+			entry, ok := normalizePublicIPv4OrCIDR(raw)
+			if !ok || strings.Contains(entry, "/") {
+				continue
+			}
+			seen[entry] = true
 		}
-		seen[ip] = true
+	} else {
+		for _, raw := range feed.CIDRs {
+			entry, ok := normalizePublicIPv4OrCIDR(raw)
+			if !ok || !strings.Contains(entry, "/") {
+				continue
+			}
+			seen[entry] = true
+		}
 	}
 
-	ips := make([]string, 0, len(seen))
-	for ip := range seen {
-		ips = append(ips, ip)
+	entries := make([]string, 0, len(seen))
+	for entry := range seen {
+		entries = append(entries, entry)
 	}
-	sort.Slice(ips, func(i, j int) bool {
-		return ipToUint32(ips[i]) < ipToUint32(ips[j])
+	sort.Slice(entries, func(i, j int) bool {
+		iStart, iPrefix := addressSortKey(entries[i])
+		jStart, jPrefix := addressSortKey(entries[j])
+		if iStart == jStart {
+			return iPrefix < jPrefix
+		}
+		return iStart < jStart
 	})
 
-	return ips, nil
+	return entries, nil
 }
 
 func newSSHClient(cfg Config) (*ssh.Client, error) {
@@ -165,9 +229,10 @@ func existingAddressList(client *ssh.Client, list string) (map[string]bool, erro
 	for _, line := range strings.Split(out, "\n") {
 		for _, field := range strings.Fields(line) {
 			if strings.HasPrefix(field, "address=") {
-				ip := strings.TrimPrefix(field, "address=")
-				if isPublicIPv4(ip) {
-					existing[ip] = true
+				value := strings.TrimPrefix(field, "address=")
+				entry, ok := normalizePublicIPv4OrCIDR(value)
+				if ok {
+					existing[entry] = true
 				}
 			}
 		}
@@ -234,6 +299,48 @@ func isPublicIPv4(value string) bool {
 		}
 	}
 	return true
+}
+
+func normalizePublicIPv4OrCIDR(value string) (string, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return "", false
+	}
+
+	if strings.Contains(v, "/") {
+		_, network, err := net.ParseCIDR(v)
+		if err != nil || network == nil || network.IP.To4() == nil {
+			return "", false
+		}
+
+		base := network.IP.Mask(network.Mask)
+		if !isPublicIPv4(base.String()) {
+			return "", false
+		}
+
+		ones, _ := network.Mask.Size()
+		return fmt.Sprintf("%s/%d", base.String(), ones), true
+	}
+
+	ip := net.ParseIP(v)
+	if ip == nil || ip.To4() == nil || !isPublicIPv4(v) {
+		return "", false
+	}
+
+	return ip.To4().String(), true
+}
+
+func addressSortKey(value string) (uint32, int) {
+	v := strings.TrimSpace(value)
+	if strings.Contains(v, "/") {
+		_, network, err := net.ParseCIDR(v)
+		if err == nil && network != nil && network.IP.To4() != nil {
+			ones, _ := network.Mask.Size()
+			return ipToUint32(network.IP.Mask(network.Mask).String()), ones
+		}
+	}
+
+	return ipToUint32(v), 32
 }
 
 func ipToUint32(value string) uint32 {
